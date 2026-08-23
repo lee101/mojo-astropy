@@ -1,6 +1,5 @@
 """Coordinate, time-scale, and celestial WCS kernels exposed through a C ABI."""
 
-from std.algorithm import parallelize
 from std.math import atan2, cos, floor, sin, sqrt
 from std.sys.info import simd_width_of
 
@@ -13,7 +12,15 @@ comptime LB = 1.550519768e-8
 comptime TDB0 = -0.0000655
 comptime PARALLEL_THRESHOLD = 262144
 comptime PARALLEL_CHUNK = 16384
-comptime PARALLEL_WORKERS = 4
+
+
+@always_inline
+def run_chunks[
+    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
+](num_work_items: Int):
+    """Run chunked work after parallel scheduling moved out of the Mojo SDK."""
+    for i in range(num_work_items):
+        func(i)
 
 
 def p(addr: Int) -> Ptr:
@@ -248,9 +255,7 @@ def ma_spherical_to_cartesian(
         )
 
     if n >= PARALLEL_THRESHOLD:
-        parallelize[work](
-            (n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK, PARALLEL_WORKERS
-        )
+        run_chunks[work]((n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK)
     else:
         spherical_to_cartesian_range(r, lat, lon, x, y, z, 0, n)
 
@@ -341,9 +346,7 @@ def ma_angular_separation(
         )
 
     if n >= PARALLEL_THRESHOLD:
-        parallelize[work](
-            (n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK, PARALLEL_WORKERS
-        )
+        run_chunks[work]((n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK)
     else:
         angular_separation_range(lon1, lat1, lon2, lat2, dst, 0, n)
 
@@ -437,9 +440,7 @@ def ma_rotate_spherical(
         )
 
     if n >= PARALLEL_THRESHOLD:
-        parallelize[work](
-            (n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK, PARALLEL_WORKERS
-        )
+        run_chunks[work]((n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK)
     else:
         rotate_spherical_range(lon, lat, matrix, dst_lon, dst_lat, 0, n)
 
@@ -638,9 +639,7 @@ def ma_wcs_pix2world(
         )
 
     if n >= PARALLEL_THRESHOLD:
-        parallelize[work](
-            (n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK, PARALLEL_WORKERS
-        )
+        run_chunks[work]((n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK)
     else:
         wcs_pix2world_range(
             x,
@@ -852,9 +851,7 @@ def ma_wcs_world2pix(
         )
 
     if n >= PARALLEL_THRESHOLD:
-        parallelize[work](
-            (n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK, PARALLEL_WORKERS
-        )
+        run_chunks[work]((n + PARALLEL_CHUNK - 1) // PARALLEL_CHUNK)
     else:
         wcs_world2pix_range(
             lon,
