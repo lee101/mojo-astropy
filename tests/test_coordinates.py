@@ -83,6 +83,18 @@ def test_angular_separation_simd_tail():
     )
 
 
+def test_angular_separation_parallel_threshold_and_tail():
+    count = 262_147
+    lon1 = np.linspace(-np.pi, np.pi, count)
+    lat1 = np.linspace(-1.2, 1.2, count)
+    lon2 = lon1[::-1].copy()
+    lat2 = lat1[::-1].copy()
+    actual = ma.angular_separation(lon1, lat1, lon2, lat2)
+    assert actual == pytest.approx(
+        astro.angular_separation(lon1, lat1, lon2, lat2), abs=2e-15
+    )
+
+
 def test_position_angle_matches_astropy():
     rng = np.random.default_rng(4)
     args = [rng.uniform(-1.4, 1.4, 2000) for _ in range(4)]
@@ -118,6 +130,16 @@ def test_skycoord_icrs_to_galactic_matches_astropy():
     assert np.max(np.abs(actual.b.deg - expected.b.deg)) < 8e-12
 
 
+def test_skycoord_rotation_simd_tail_wraps_longitude():
+    ra = np.linspace(0.0, 359.0, 7)
+    dec = np.linspace(-70.0, 70.0, 7)
+    expected = astro.SkyCoord(ra * u.deg, dec * u.deg).galactic
+    actual = ma.SkyCoord(ra, dec, unit="deg").galactic
+    lon_error = (actual.l.deg - expected.l.deg + 180.0) % 360.0 - 180.0
+    assert np.max(np.abs(lon_error)) < 8e-12
+    assert np.max(np.abs(actual.b.deg - expected.b.deg)) < 8e-12
+
+
 def test_skycoord_galactic_roundtrip():
     lon = np.linspace(0.0, 359.0, 1000)
     lat = np.linspace(-80.0, 80.0, 1000)
@@ -126,6 +148,16 @@ def test_skycoord_galactic_roundtrip():
     error = (back.l.deg - lon + 180.0) % 360.0 - 180.0
     assert np.max(np.abs(error)) < 2e-12
     assert np.max(np.abs(back.b.deg - lat)) < 2e-12
+
+
+def test_skycoord_copy_does_not_alias_radian_inputs():
+    lon = np.array([0.1, 0.2])
+    lat = np.array([-0.3, 0.4])
+    coord = ma.SkyCoord(lon, lat, unit="rad")
+    lon[:] = 1.0
+    lat[:] = 1.0
+    assert coord.ra.rad == pytest.approx([0.1, 0.2])
+    assert coord.dec.rad == pytest.approx([-0.3, 0.4])
 
 
 def test_skycoord_separation_matches_astropy():

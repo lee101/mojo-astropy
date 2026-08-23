@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._lib import addr, f64, lib
+from ._lib import addr, f64, lib, parallel_call
 
 
 class NoConvergence(RuntimeError):
@@ -149,10 +149,60 @@ class WCS:
             points = f64(points)
             if points.shape[-1] != 2:
                 raise ValueError("coordinate array must have final dimension 2")
-            return points[..., 0], points[..., 1], int(origin), True
+            return points[..., 0], points[..., 1], int(origin), True, points
         if len(args) == 3:
-            return args[0], args[1], int(args[2]), False
+            return args[0], args[1], int(args[2]), False, None
         raise TypeError("expected (N, 2), origin or x, y, origin")
+
+    def _pix2world_points(self, points, origin):
+        result = np.empty_like(points)
+        cd, tan, _, _, _ = self._kernel_params()
+        if points.size:
+            size = points.size // 2
+
+            def call(begin, end):
+                offset = begin * 16
+                lib().ma_wcs_pix2world_points(
+                    addr(points) + offset,
+                    addr(result) + offset,
+                    end - begin,
+                    origin,
+                    *self.wcs.crpix,
+                    *self.wcs.crval,
+                    *cd.reshape(-1),
+                    tan,
+                )
+
+            parallel_call(size, call)
+        return result
+
+    def _world2pix_points(self, points, origin, tolerance, maxiter, quiet=False):
+        if tolerance <= 0 or not np.isfinite(tolerance):
+            raise ValueError("tolerance must be a positive finite number")
+        if maxiter < 1:
+            raise ValueError("maxiter must be at least 1")
+        result = np.empty_like(points)
+        cd, tan, _, _, _ = self._kernel_params()
+        if points.size:
+            size = points.size // 2
+
+            def call(begin, end):
+                offset = begin * 16
+                lib().ma_wcs_world2pix_points(
+                    addr(points) + offset,
+                    addr(result) + offset,
+                    end - begin,
+                    origin,
+                    *self.wcs.crpix,
+                    *self.wcs.crval,
+                    *cd.reshape(-1),
+                    tan,
+                )
+
+            parallel_call(size, call)
+        if not quiet and not np.all(np.isfinite(result)):
+            raise NoConvergence("world-to-pixel iteration failed to converge for 0 coordinate(s)")
+        return result
 
     def _pix2world(self, x, y, origin, use_sip):
         bx, by = np.broadcast_arrays(x, y)
@@ -161,22 +211,28 @@ class WCS:
         lon, lat = np.empty_like(xv), np.empty_like(yv)
         cd, tan, a, b, order = self._kernel_params()
         if xv.size:
-            lib().ma_wcs_pix2world(
-                addr(xv),
-                addr(yv),
-                addr(lon),
-                addr(lat),
-                xv.size,
-                origin,
-                *self.wcs.crpix,
-                *self.wcs.crval,
-                *cd.reshape(-1),
-                tan,
-                int(use_sip and self.sip is not None),
-                addr(a),
-                addr(b),
-                order,
-            )
+            sip_enabled = int(use_sip and self.sip is not None)
+
+            def call(begin, end):
+                offset = begin * 8
+                lib().ma_wcs_pix2world(
+                    addr(xv) + offset,
+                    addr(yv) + offset,
+                    addr(lon) + offset,
+                    addr(lat) + offset,
+                    end - begin,
+                    origin,
+                    *self.wcs.crpix,
+                    *self.wcs.crval,
+                    *cd.reshape(-1),
+                    tan,
+                    sip_enabled,
+                    addr(a),
+                    addr(b),
+                    order,
+                )
+
+            call(0, xv.size)
         return lon.reshape(shape), lat.reshape(shape)
 
     def _world2pix(self, lon, lat, origin, use_sip, tolerance, maxiter, quiet=False):
@@ -188,46 +244,55 @@ class WCS:
         shape = blon.shape
         lonv, latv = f64(blon).reshape(-1), f64(blat).reshape(-1)
         x, y = np.empty_like(lonv), np.empty_like(latv)
-        converged = np.empty_like(lonv)
         cd, tan, a, b, order = self._kernel_params()
+        sip_enabled = int(use_sip and self.sip is not None)
+        converged = np.empty_like(lonv) if sip_enabled else np.empty(1)
         if lonv.size:
-            lib().ma_wcs_world2pix(
-                addr(lonv),
-                addr(latv),
-                addr(x),
-                addr(y),
-                addr(converged),
-                lonv.size,
-                origin,
-                *self.wcs.crpix,
-                *self.wcs.crval,
-                *cd.reshape(-1),
-                tan,
-                int(use_sip and self.sip is not None),
-                addr(a),
-                addr(b),
-                order,
-                tolerance,
-                maxiter,
-            )
+            def call(begin, end):
+                offset = begin * 8
+                lib().ma_wcs_world2pix(
+                    addr(lonv) + offset,
+                    addr(latv) + offset,
+                    addr(x) + offset,
+                    addr(y) + offset,
+                    addr(converged) + offset,
+                    end - begin,
+                    origin,
+                    *self.wcs.crpix,
+                    *self.wcs.crval,
+                    *cd.reshape(-1),
+                    tan,
+                    sip_enabled,
+                    addr(a),
+                    addr(b),
+                    order,
+                    tolerance,
+                    maxiter,
+                )
+
+            call(0, lonv.size)
         if not quiet and (
             not np.all(np.isfinite(x))
             or not np.all(np.isfinite(y))
-            or not np.all(converged != 0.0)
+            or (sip_enabled and not np.all(converged != 0.0))
         ):
-            failed = int(np.count_nonzero(converged == 0.0))
+            failed = int(np.count_nonzero(converged == 0.0)) if sip_enabled else 0
             raise NoConvergence(
                 f"world-to-pixel iteration failed to converge for {failed} coordinate(s)"
             )
         return x.reshape(shape), y.reshape(shape)
 
     def all_pix2world(self, *args, **kwargs):
-        x, y, origin, joined = self._parse_args(args)
+        x, y, origin, joined, points = self._parse_args(args)
+        if joined and self.sip is None:
+            return self._pix2world_points(points, origin)
         lon, lat = self._pix2world(x, y, origin, True)
         return np.stack((lon, lat), axis=-1) if joined else (lon, lat)
 
     def wcs_pix2world(self, *args, **kwargs):
-        x, y, origin, joined = self._parse_args(args)
+        x, y, origin, joined, points = self._parse_args(args)
+        if joined:
+            return self._pix2world_points(points, origin)
         lon, lat = self._pix2world(x, y, origin, False)
         return np.stack((lon, lat), axis=-1) if joined else (lon, lat)
 
@@ -241,12 +306,16 @@ class WCS:
         quiet=False,
         **kwargs,
     ):
-        lon, lat, origin, joined = self._parse_args(args)
+        lon, lat, origin, joined, points = self._parse_args(args)
+        if joined and self.sip is None:
+            return self._world2pix_points(points, origin, tolerance, maxiter, quiet)
         x, y = self._world2pix(lon, lat, origin, True, tolerance, maxiter, quiet)
         return np.stack((x, y), axis=-1) if joined else (x, y)
 
     def wcs_world2pix(self, *args, **kwargs):
-        lon, lat, origin, joined = self._parse_args(args)
+        lon, lat, origin, joined, points = self._parse_args(args)
+        if joined:
+            return self._world2pix_points(points, origin, 1e-10, 1)
         x, y = self._world2pix(lon, lat, origin, False, 1e-10, 1)
         return np.stack((x, y), axis=-1) if joined else (x, y)
 

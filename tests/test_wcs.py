@@ -98,6 +98,17 @@ def test_tan_world2pix_matches_and_roundtrips(tan_header):
     )
 
 
+def test_tan_joined_parallel_threshold_and_simd_tail(tan_header):
+    count = 262_147
+    points = np.column_stack(
+        (np.linspace(0.0, 1024.0, count), np.linspace(768.0, 0.0, count))
+    )
+    wcs = WCS(tan_header)
+    assert wcs.all_world2pix(wcs.all_pix2world(points, 0), 0) == pytest.approx(
+        points, abs=3e-10
+    )
+
+
 def test_sip_forward_matches_astropy(sip_header):
     rng = np.random.default_rng(12)
     points = rng.uniform([-100, -100], [1100, 900], (20_000, 2))

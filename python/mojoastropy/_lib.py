@@ -6,6 +6,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -17,6 +18,8 @@ LIB = os.environ.get(
 
 I = ctypes.c_int64
 F = ctypes.c_double
+PARALLEL_THRESHOLD = 262_144
+PARALLEL_WORKERS = 4
 
 _SIGNATURES = {
     "ma_time_convert": ([I, I, I, I, I, I, I], None),
@@ -29,10 +32,12 @@ _SIGNATURES = {
         [I, I, I, I, I, I] + [F] * 8 + [I, I, I, I, I],
         None,
     ),
+    "ma_wcs_pix2world_points": ([I, I, I, I] + [F] * 8 + [I], None),
     "ma_wcs_world2pix": (
         [I, I, I, I, I, I, I] + [F] * 8 + [I, I, I, I, I, F, I],
         None,
     ),
+    "ma_wcs_world2pix_points": ([I, I, I, I] + [F] * 8 + [I], None),
 }
 
 
@@ -71,6 +76,7 @@ def build(force: bool = False) -> str:
 
 
 _library = None
+_executor = None
 
 
 def lib() -> ctypes.CDLL:
@@ -82,6 +88,22 @@ def lib() -> ctypes.CDLL:
             fn.argtypes = argtypes
             fn.restype = restype
     return _library
+
+
+def parallel_call(size: int, call) -> None:
+    global _executor
+    if size < PARALLEL_THRESHOLD:
+        call(0, size)
+        return
+    if _executor is None:
+        _executor = ThreadPoolExecutor(max_workers=PARALLEL_WORKERS)
+    futures = []
+    for worker in range(PARALLEL_WORKERS):
+        begin = worker * size // PARALLEL_WORKERS
+        end = (worker + 1) * size // PARALLEL_WORKERS
+        futures.append(_executor.submit(call, begin, end))
+    for future in futures:
+        future.result()
 
 
 def f64(value) -> np.ndarray:

@@ -12,6 +12,7 @@ comptime LB = 1.550519768e-8
 comptime TDB0 = -0.0000655
 comptime PARALLEL_THRESHOLD = 262144
 comptime PARALLEL_CHUNK = 16384
+comptime TWO_PI = 6.283185307179586476925286766559
 
 
 @always_inline
@@ -395,7 +396,9 @@ def rotate_spherical_range(
         var rx = matrix[0] * x + matrix[1] * y + matrix[2] * z
         var ry = matrix[3] * x + matrix[4] * y + matrix[5] * z
         var rz = matrix[6] * x + matrix[7] * y + matrix[8] * z
-        dst_lon.store(i, atan2(ry, rx))
+        var result_lon = atan2(ry, rx)
+        result_lon += result_lon.lt(0.0).select(TWO_PI, 0.0)
+        dst_lon.store(i, result_lon)
         dst_lat.store(i, atan2(rz, hypot2_simd(rx, ry)))
         i += W
     while i < end:
@@ -407,6 +410,8 @@ def rotate_spherical_range(
         var ry = matrix[3] * x + matrix[4] * y + matrix[5] * z
         var rz = matrix[6] * x + matrix[7] * y + matrix[8] * z
         dst_lon[i] = atan2(ry, rx)
+        if dst_lon[i] < 0.0:
+            dst_lon[i] += TWO_PI
         dst_lat[i] = atan2(rz, hypot2(rx, ry))
         i += 1
 
@@ -665,6 +670,79 @@ def ma_wcs_pix2world(
         )
 
 
+@export("ma_wcs_pix2world_points")
+def ma_wcs_pix2world_points(
+    points_addr: Int,
+    world_addr: Int,
+    n: Int,
+    origin: Int,
+    crpix1: Float64,
+    crpix2: Float64,
+    crval1: Float64,
+    crval2: Float64,
+    cd11: Float64,
+    cd12: Float64,
+    cd21: Float64,
+    cd22: Float64,
+    is_tan: Int,
+) abi("C"):
+    var points = p(points_addr)
+    var world = p(world_addr)
+    comptime W = simd_width_of[DType.float64]()
+    var ra0 = crval1 * DEG
+    var dec0 = crval2 * DEG
+    var offset = Float64(1 - origin)
+    var i = 0
+    while i + W <= n:
+        var u = (points + i * 2).strided_load[width=W](2) + offset - crpix1
+        var v = (points + i * 2 + 1).strided_load[width=W](2) + offset - crpix2
+        var px = cd11 * u + cd12 * v
+        var py = cd21 * u + cd22 * v
+        if is_tan == 0:
+            (world + i * 2).strided_store[width=W](crval1 + px, 2)
+            (world + i * 2 + 1).strided_store[width=W](crval2 + py, 2)
+        else:
+            var xi = px * DEG
+            var eta = py * DEG
+            var den = cos(dec0) - eta * sin(dec0)
+            var ra = ra0 + atan2(xi, den)
+            var dec = atan2(
+                sin(dec0) + eta * cos(dec0), hypot2_simd(den, xi)
+            )
+            (world + i * 2).strided_store[width=W](ra / DEG, 2)
+            (world + i * 2 + 1).strided_store[width=W](dec / DEG, 2)
+            for lane in range(W):
+                var index = (i + lane) * 2
+                while world[index] < 0.0:
+                    world[index] += 360.0
+                while world[index] >= 360.0:
+                    world[index] -= 360.0
+        i += W
+    while i < n:
+        var index = i * 2
+        var u = points[index] + offset - crpix1
+        var v = points[index + 1] + offset - crpix2
+        var px = cd11 * u + cd12 * v
+        var py = cd21 * u + cd22 * v
+        if is_tan == 0:
+            world[index] = crval1 + px
+            world[index + 1] = crval2 + py
+        else:
+            var xi = px * DEG
+            var eta = py * DEG
+            var den = cos(dec0) - eta * sin(dec0)
+            var ra_deg = (ra0 + atan2(xi, den)) / DEG
+            while ra_deg < 0.0:
+                ra_deg += 360.0
+            while ra_deg >= 360.0:
+                ra_deg -= 360.0
+            world[index] = ra_deg
+            world[index + 1] = atan2(
+                sin(dec0) + eta * cos(dec0), hypot2(den, xi)
+            ) / DEG
+        i += 1
+
+
 def wcs_world2pix_range(
     lon: Ptr,
     lat: Ptr,
@@ -744,7 +822,8 @@ def wcs_world2pix_range(
                     break
         x.store(i, u + crpix1 - offset)
         y.store(i, v + crpix2 - offset)
-        converged.store(i, done)
+        if use_sip != 0:
+            converged.store(i, done)
         i += W
     while i < end:
         var px = lon[i] - crval1
@@ -783,7 +862,8 @@ def wcs_world2pix_range(
                     break
         x[i] = u + crpix1 - Float64(1 - origin)
         y[i] = v + crpix2 - Float64(1 - origin)
-        converged[i] = done
+        if use_sip != 0:
+            converged[i] = done
         i += 1
 
 
@@ -878,3 +958,69 @@ def ma_wcs_world2pix(
             tolerance,
             maxiter,
         )
+
+
+@export("ma_wcs_world2pix_points")
+def ma_wcs_world2pix_points(
+    world_addr: Int,
+    points_addr: Int,
+    n: Int,
+    origin: Int,
+    crpix1: Float64,
+    crpix2: Float64,
+    crval1: Float64,
+    crval2: Float64,
+    cd11: Float64,
+    cd12: Float64,
+    cd21: Float64,
+    cd22: Float64,
+    is_tan: Int,
+) abi("C"):
+    var world = p(world_addr)
+    var points = p(points_addr)
+    comptime W = simd_width_of[DType.float64]()
+    var det_cd = cd11 * cd22 - cd12 * cd21
+    var ra0 = crval1 * DEG
+    var dec0 = crval2 * DEG
+    var offset = Float64(1 - origin)
+    var i = 0
+    while i + W <= n:
+        var lonv = (world + i * 2).strided_load[width=W](2)
+        var latv = (world + i * 2 + 1).strided_load[width=W](2)
+        var px = lonv - crval1
+        var py = latv - crval2
+        if is_tan != 0:
+            var ra = lonv * DEG
+            var dec = latv * DEG
+            var dra = ra - ra0
+            var sin_dec = sin(dec)
+            var cos_dec = cos(dec)
+            var cos_dra = cos(dra)
+            var den = sin_dec * sin(dec0) + cos_dec * cos(dec0) * cos_dra
+            px = cos_dec * sin(dra) / den / DEG
+            py = (
+                sin_dec * cos(dec0) - cos_dec * sin(dec0) * cos_dra
+            ) / den / DEG
+        var u = (cd22 * px - cd12 * py) / det_cd
+        var v = (-cd21 * px + cd11 * py) / det_cd
+        (points + i * 2).strided_store[width=W](u + crpix1 - offset, 2)
+        (points + i * 2 + 1).strided_store[width=W](v + crpix2 - offset, 2)
+        i += W
+    while i < n:
+        var index = i * 2
+        var px = world[index] - crval1
+        var py = world[index + 1] - crval2
+        if is_tan != 0:
+            var ra = world[index] * DEG
+            var dec = world[index + 1] * DEG
+            var dra = ra - ra0
+            var den = sin(dec) * sin(dec0) + cos(dec) * cos(dec0) * cos(dra)
+            px = cos(dec) * sin(dra) / den / DEG
+            py = (
+                sin(dec) * cos(dec0) - cos(dec) * sin(dec0) * cos(dra)
+            ) / den / DEG
+        var u = (cd22 * px - cd12 * py) / det_cd
+        var v = (-cd21 * px + cd11 * py) / det_cd
+        points[index] = u + crpix1 - offset
+        points[index + 1] = v + crpix2 - offset
+        i += 1

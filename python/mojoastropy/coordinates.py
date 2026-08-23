@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._lib import addr, f64, lib
+from ._lib import addr, f64, lib, parallel_call
 
 _DEG = np.pi / 180.0
 _ICRS_TO_GALACTIC = np.array(
@@ -96,6 +96,13 @@ def _restore(value, shape):
     return result[()] if shape == () else result
 
 
+def _copy_if_shared(value, source):
+    try:
+        return value.copy() if np.shares_memory(value, np.asanyarray(source)) else value
+    except (TypeError, ValueError):
+        return value.copy()
+
+
 def spherical_to_cartesian(r, lat, lon):
     shape = _shape(np.asanyarray(r), np.asanyarray(_angle_value(lat)), np.asanyarray(_angle_value(lon)))
     rv, latv, lonv = _broadcast(r, _angle_value(lat), _angle_value(lon))
@@ -130,9 +137,18 @@ def angular_separation(lon1, lat1, lon2, lat2):
     a, b, c, d = _broadcast(*values)
     result = np.empty_like(a)
     if result.size:
-        lib().ma_angular_separation(
-            addr(a), addr(b), addr(c), addr(d), addr(result), result.size
-        )
+        def call(begin, end):
+            offset = begin * 8
+            lib().ma_angular_separation(
+                addr(a) + offset,
+                addr(b) + offset,
+                addr(c) + offset,
+                addr(d) + offset,
+                addr(result) + offset,
+                end - begin,
+            )
+
+        parallel_call(result.size, call)
     return _restore(result, shape)
 
 
@@ -181,10 +197,18 @@ def _rotate(lon, lat, matrix):
         raise ValueError("rotation matrix must have shape (3, 3)")
     dst_lon, dst_lat = np.empty_like(lonv), np.empty_like(latv)
     if lonv.size:
-        lib().ma_rotate_spherical(
-            addr(lonv), addr(latv), addr(matrix), addr(dst_lon), addr(dst_lat), lonv.size
-        )
-        np.mod(dst_lon, 2.0 * np.pi, out=dst_lon)
+        def call(begin, end):
+            offset = begin * 8
+            lib().ma_rotate_spherical(
+                addr(lonv) + offset,
+                addr(latv) + offset,
+                addr(matrix),
+                addr(dst_lon) + offset,
+                addr(dst_lat) + offset,
+                end - begin,
+            )
+
+        parallel_call(lonv.size, call)
     return _restore(dst_lon, shape), _restore(dst_lat, shape)
 
 
@@ -228,8 +252,8 @@ class SkyCoord:
         self._lat = Angle(second, units[1] or ("rad" if not hasattr(second, "to_value") else "rad"))
         self.frame = Galactic() if frame == "galactic" else ICRS()
         if copy:
-            self._lon = self._lon.copy()
-            self._lat = self._lat.copy()
+            self._lon = _copy_if_shared(self._lon, first)
+            self._lat = _copy_if_shared(self._lat, second)
 
     @property
     def shape(self):

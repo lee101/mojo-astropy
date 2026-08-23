@@ -89,13 +89,13 @@ Python API.
 
 | case | mojo-astropy | astropy | result |
 | --- | ---: | ---: | ---: |
-| spherical_to_cartesian (2M) | 37.86 ms | 225.56 ms | 5.96x faster |
-| angular_separation (2M) | 99.84 ms | 485.83 ms | 4.87x faster |
-| ICRS -> Galactic (2M) | 133.96 ms | 980.67 ms | 7.32x faster |
-| UTC -> TCG (2M) | 128.19 ms | 801.94 ms | 6.26x faster |
-| TAN pix2world (2M) | 63.58 ms | 434.49 ms | 6.83x faster |
-| TAN world2pix (2M) | 73.78 ms | 451.71 ms | 6.12x faster |
-| SIP world2pix (500k) | 29.87 ms | 264.97 ms | 8.87x faster |
+| spherical_to_cartesian (2M) | 111.03 ms | 474.06 ms | 4.27x faster |
+| angular_separation (2M) | 68.40 ms | 907.18 ms | 13.26x faster |
+| ICRS -> Galactic (2M) | 210.63 ms | 1677.17 ms | 7.96x faster |
+| UTC -> TCG (2M) | 311.79 ms | 1742.40 ms | 5.59x faster |
+| TAN pix2world (2M) | 35.23 ms | 477.18 ms | 13.55x faster |
+| TAN world2pix (2M) | 31.17 ms | 694.05 ms | 22.26x faster |
+| SIP world2pix (500k) | 37.46 ms | 244.45 ms | 6.53x faster |
 
 These values are the output of `pixi run bench` on this machine. Astropy 8.0.1
 is the reference. Timings vary with hardware and system load; run the command
@@ -117,12 +117,19 @@ the conventional axis order, and SIP coefficients use dense row-major
 `coefficient[i, j]` storage. No Mojo kernel allocates memory.
 
 Coordinate and TAN loops use native-width `float64` SIMD loads and stores with
-scalar remainder loops. Arrays of at least 262,144 elements are divided into
-16,384-element chunks across four workers; smaller calls stay serial. SIP
-values and both Jacobian rows are evaluated together with nested Horner
-polynomials instead of repeated power loops.
+scalar remainder loops. Joined `(n, 2)` TAN calls use strided SIMD directly on
+the NumPy point matrix and write the final matrix in place, avoiding split
+buffers and `np.stack`. Angular separation, spherical rotations, and joined TAN
+calls of at least 262,144 elements are divided across four native calls on
+disjoint zero-copy pointer ranges; smaller calls stay serial. SIP values and
+both Jacobian rows are evaluated together with nested Horner polynomials
+instead of repeated power loops.
 
-Numerical behavior is checked in 45 tests, primarily against Astropy 8.0.1,
+No GPU path is provided: the covered kernels do not sustain the requested
+greater-than-2-flops-per-byte arithmetic intensity after host/device transfers,
+so a GPU path would add overhead rather than improve these public operations.
+
+Numerical behavior is checked in 49 tests, primarily against Astropy 8.0.1,
 including FFI boundary validation, UTC
 leap-day fractions, split-JD scale conversions, pole and antipode geometry,
 both FITS pixel origins, TAN round trips, and cubic SIP forward/inverse paths.
